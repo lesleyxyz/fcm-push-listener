@@ -223,6 +223,9 @@ impl CheckedSession {
 
         // Install the default crypto provider. If a different one is already registered, this
         // will do nothing.
+        #[cfg(feature = "aws-lc-rs")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(feature = "ring")]
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         const ERR_RESOLVE: Error =

@@ -1,5 +1,7 @@
 pub use fcm_push_listener::Error;
-use fcm_push_listener::{new_heartbeat_ack, MessageStream, Registration, Session as GcmSession, WebPushKeys};
+use fcm_push_listener::{
+    new_heartbeat_ack, MessageStream, Registration, Session as GcmSession, WebPushKeys,
+};
 use tokio::io::AsyncWriteExt;
 
 async fn run(registration: Registration) -> Result<(), fcm_push_listener::Error> {
