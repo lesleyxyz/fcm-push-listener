@@ -1,5 +1,6 @@
 use crate::Error;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 fn to_base64<S: serde::ser::Serializer>(v: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
     use base64::Engine;
@@ -71,6 +72,34 @@ impl Registration {
             fcm_token: response.token,
             keys: push_keys,
         })
+    }
+
+    pub async fn unregister_request(
+        http: &reqwest::Client,
+        project_id: &str,
+        api_key: &str,
+        firebase_installation_auth_token: &str,
+        fcm_token: &str,
+    ) -> Result<(), Error> {
+        const FCM_REGISTRATION_API: &str = "https://fcmregistrations.googleapis.com/v1";
+
+        const API_NAME: &str = "FCM Registration";
+        const API_KEY_HEADER: &str = "x-goog-api-key";
+        const AUTH_HEADER: &str = "x-goog-firebase-installations-auth";
+
+        let url = format!("{FCM_REGISTRATION_API}/projects/{project_id}/registrations/{fcm_token}");
+        http.delete(url)
+            .header(API_KEY_HEADER, api_key)
+            .header(AUTH_HEADER, firebase_installation_auth_token)
+            .send()
+            .await
+            .map_err(|e| Error::Request(API_NAME, e))?
+            .error_for_status()
+            .map_err(|e| Error::Request(API_NAME, e))?
+            .json::<HashMap<(), ()>>()
+            .await
+            .map_err(|e| Error::Response(API_NAME, e))
+            .map(drop)
     }
 }
 
