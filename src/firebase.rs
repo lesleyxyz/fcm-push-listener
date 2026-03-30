@@ -62,7 +62,8 @@ impl InstallationAuthToken {
             .await
             .map_err(|e| Error::Request(API, e))?;
 
-        let response: InstallationResponse = response.json().await.map_err(|e| Error::Response(API, e))?;
+        let response: InstallationResponse =
+            response.json().await.map_err(|e| Error::Response(API, e))?;
 
         Ok(response.auth_token)
     }
