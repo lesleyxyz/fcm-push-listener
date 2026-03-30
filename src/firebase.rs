@@ -62,12 +62,7 @@ impl InstallationAuthToken {
             .await
             .map_err(|e| Error::Request(API, e))?;
 
-        let response_text = response.text().await.map_err(|e| Error::Response(API, e))?;
-
-        let response: InstallationResponse =
-            serde_json::from_str(&response_text).map_err(|e| {
-                Error::DependencyRejection(API, format!("JSON parse error: {e}"))
-            })?;
+        let response: InstallationResponse = response.json().await.map_err(|e| Error::Response(API, e))?;
 
         Ok(response.auth_token)
     }

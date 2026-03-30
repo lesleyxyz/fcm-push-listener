@@ -63,13 +63,10 @@ impl Registration {
             .await
             .map_err(|e| Error::Request(API_NAME, e))?;
 
-        let response_text = response
-            .text()
+        let response: RegisterResponse = response
+            .json()
             .await
             .map_err(|e| Error::Response(API_NAME, e))?;
-
-        let response: RegisterResponse = serde_json::from_str(&response_text)
-            .map_err(|e| Error::DependencyRejection(API_NAME, format!("JSON parse error: {e}")))?;
 
         Ok(Self {
             fcm_token: response.token,
