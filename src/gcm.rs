@@ -149,6 +149,58 @@ impl Session {
             None => Err(ERR_EOF),
         }
     }
+
+    /// Register with custom c2dm/register3 parameters.
+    ///
+    /// This allows registering as a native Android app by passing the appropriate
+    /// form parameters (sender ID, package name, etc.) instead of the default
+    /// web push parameters. The caller is responsible for constructing the full
+    /// parameter set; "device" is added automatically from the session.
+    pub async fn request_token_with_params(
+        &self,
+        params: std::collections::HashMap<&str, &str>,
+    ) -> Result<String, Error> {
+        let android_id = self.android_id.to_string();
+        let auth_header = format!("AidLogin {}:{}", &android_id, &self.security_token);
+
+        let mut params = params;
+        params.insert("device", &android_id);
+
+        const API_NAME: &str = "GCM registration";
+        let result = reqwest::Client::new()
+            .post(REGISTER_URL)
+            .form(&params)
+            .header(reqwest::header::AUTHORIZATION, auth_header)
+            .send()
+            .await
+            .map_err(|e| Error::Request(API_NAME, e))?;
+
+        let response_text = result
+            .text()
+            .await
+            .map_err(|e| Error::Response(API_NAME, e))?;
+
+        log::debug!("GCM register response: {}", response_text);
+
+        const ERR_EOF: Error = Error::DependencyFailure(API_NAME, "malformed response");
+
+        let mut tokens = response_text.split('=');
+        match tokens.next() {
+            Some("Error") => {
+                return Err(Error::DependencyRejection(
+                    API_NAME,
+                    tokens.next().unwrap_or("no reasons given").into(),
+                ))
+            }
+            None => return Err(ERR_EOF),
+            _ => {}
+        }
+
+        match tokens.next() {
+            Some(v) => Ok(String::from(v)),
+            None => Err(ERR_EOF),
+        }
+    }
 }
 
 fn new_tls_initiator() -> tokio_rustls::TlsConnector {

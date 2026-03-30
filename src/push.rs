@@ -50,6 +50,49 @@ pub struct DataMessage {
     pub persistent_id: Option<String>,
 }
 
+/// A push message received in native Android mode.
+/// Contains the raw appData key-value pairs (incl. gcm.n.title, gcm.n.body, etc.)
+/// and optional raw_data bytes — no web push decryption needed.
+#[derive(serde::Serialize)]
+pub struct NativeDataMessage {
+    /// All appData fields from the MCS DataMessageStanza (e.g. "gcm.n.title", "type", etc.)
+    pub app_data: std::collections::HashMap<String, String>,
+    /// Optional binary payload
+    pub raw_data: Option<Vec<u8>>,
+    pub persistent_id: Option<String>,
+    pub from: String,
+    pub category: String,
+}
+
+impl NativeDataMessage {
+    fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        use prost::Message;
+
+        let message = crate::mcs::DataMessageStanza::decode(bytes)
+            .map_err(|e| Error::ProtobufDecode("FCM data message", e))?;
+
+        let mut app_data = std::collections::HashMap::new();
+        for field in &message.app_data {
+            app_data.insert(field.key.clone(), field.value.clone());
+        }
+
+        Ok(Self {
+            app_data,
+            raw_data: message.raw_data,
+            persistent_id: message.persistent_id,
+            from: message.from,
+            category: message.category,
+        })
+    }
+}
+
+/// Message type for native Android mode.
+pub enum NativeMessage {
+    HeartbeatPing,
+    Data(NativeDataMessage),
+    Other(u8, Bytes),
+}
+
 impl DataMessage {
     fn decode(eckey: &EcKeyComponents, auth_secret: &[u8], bytes: &[u8]) -> Result<Self, Error> {
         use base64::engine::general_purpose::URL_SAFE;
@@ -283,4 +326,145 @@ pub fn new_heartbeat_ack() -> BytesMut {
         .expect("heartbeat ack serialization should succeed");
 
     bytes
+}
+
+// ─── NativeMessageStream ─────────────────────────────────────────────────────
+// Like MessageStream but for native Android mode — no ECDH keys, no decryption.
+
+pin_project! {
+    pub struct NativeMessageStream<T> {
+        #[pin]
+        inner: T,
+        bytes_required: usize,
+        receive_buffer: BytesMut,
+    }
+}
+
+impl NativeMessageStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    pub fn wrap(connection: crate::gcm::Connection) -> Self {
+        Self::new(connection.0)
+    }
+}
+
+impl<T> NativeMessageStream<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            bytes_required: 2,
+            receive_buffer: BytesMut::with_capacity(1024),
+        }
+    }
+
+    fn try_read_varint<'a>(mut bytes: impl Iterator<Item = &'a u8>) -> (usize, usize) {
+        let mut result = 0;
+        let mut bytes_read = 0;
+
+        loop {
+            let byte = match bytes.next() {
+                None => return (result, 2 + bytes_read),
+                Some(v) => v,
+            };
+
+            let value_part = byte & !0x80u8;
+            result += (value_part as usize) << (bytes_read * 7);
+
+            if value_part.eq(byte) {
+                return (result, 2 + bytes_read);
+            }
+
+            bytes_read += 1;
+        }
+    }
+}
+
+impl<T> tokio_stream::Stream for NativeMessageStream<T>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    type Item = Result<NativeMessage, Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        use bytes::Buf;
+        use std::future::Future;
+        use tokio::io::AsyncReadExt;
+
+        loop {
+            let mut bytes = self.receive_buffer.iter();
+            if let Some(tag_value) = bytes.next() {
+                let tag_value = *tag_value;
+                let tag = MessageTag::try_from(tag_value);
+                if matches!(tag, Ok(MessageTag::Close)) {
+                    self.bytes_required = 0;
+                    self.receive_buffer.clear();
+                    return Poll::Ready(None);
+                }
+
+                let (size, offset) = Self::try_read_varint(bytes);
+                let bytes_required = offset + size;
+                if bytes_required <= self.receive_buffer.len() {
+                    self.bytes_required = 2;
+
+                    self.receive_buffer.advance(offset);
+                    let bytes = self.receive_buffer.split_to(size);
+                    return Poll::Ready(Some(Ok(match tag {
+                        Ok(MessageTag::DataMessageStanza) => {
+                            match NativeDataMessage::decode(&bytes) {
+                                Err(e) => return Poll::Ready(Some(Err(e))),
+                                Ok(m) => NativeMessage::Data(m),
+                            }
+                        }
+                        Ok(MessageTag::HeartbeatPing) => NativeMessage::HeartbeatPing,
+                        _ => NativeMessage::Other(tag_value, bytes.into()),
+                    })));
+                }
+
+                let capacity = self.receive_buffer.capacity();
+                if bytes_required > capacity {
+                    self.receive_buffer.reserve(bytes_required - capacity);
+                }
+
+                self.bytes_required = bytes_required;
+            } else if self.bytes_required == 0 {
+                return Poll::Ready(None);
+            }
+
+            loop {
+                let mut that = self.as_mut().project();
+                let task = that.inner.read_buf(that.receive_buffer);
+                tokio::pin!(task);
+                match task.poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => {
+                        self.bytes_required = 0;
+                        self.receive_buffer.clear();
+                        return Poll::Ready(Some(Err(Error::Socket(e))));
+                    }
+                    Poll::Ready(Ok(0)) => {
+                        self.bytes_required = 0;
+                        self.receive_buffer.clear();
+                        return Poll::Ready(None);
+                    }
+                    _ => {
+                        if self.receive_buffer.len() >= self.bytes_required {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<T> std::ops::Deref for NativeMessageStream<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T> std::ops::DerefMut for NativeMessageStream<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
 }
